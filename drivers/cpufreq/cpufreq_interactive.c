@@ -654,6 +654,7 @@ static void exit_mode(struct cpufreq_interactive_tunables * tunables)
 }
 #endif
 
+#define MAX_LOCAL_LOAD 100
 static void cpufreq_interactive_timer(unsigned long data)
 {
 	u64 now;
@@ -708,7 +709,7 @@ static void cpufreq_interactive_timer(unsigned long data)
 	spin_lock_irqsave(&pcpu->target_freq_lock, flags);
 	do_div(cputime_speedadj, delta_time);
 	loadadjfreq = (unsigned int)cputime_speedadj * 100;
-	cpu_load = loadadjfreq / pcpu->target_freq;
+	cpu_load = loadadjfreq / pcpu->policy->cur;
 	boosted = tunables->boost_val || now < tunables->boostpulse_endtime;
 
 #ifdef CONFIG_PMU_COREMEM_RATIO
@@ -730,7 +731,8 @@ static void cpufreq_interactive_timer(unsigned long data)
 #endif
 
 	if (cpu_load >= tunables->go_hispeed_load || boosted) {
-		if (pcpu->target_freq < tunables->hispeed_freq) {
+		if (pcpu->policy->cur < tunables->hispeed_freq &&
+		    cpu_load <= MAX_LOCAL_LOAD) {
 			new_freq = tunables->hispeed_freq;
 		} else {
 			new_freq = choose_freq(pcpu, loadadjfreq);
@@ -745,18 +747,17 @@ static void cpufreq_interactive_timer(unsigned long data)
 			new_freq = tunables->hispeed_freq;
 	}
 
-	if (pcpu->target_freq >= tunables->hispeed_freq &&
-	    new_freq > pcpu->target_freq &&
+	if (cpu_load <= MAX_LOCAL_LOAD &&
+	    pcpu->policy->cur >= tunables->hispeed_freq &&
+	    new_freq > pcpu->policy->cur &&
 	    now - pcpu->hispeed_validate_time <
-	    freq_to_above_hispeed_delay(tunables, pcpu->target_freq)) {
+	    freq_to_above_hispeed_delay(tunables, pcpu->policy->cur)) {
 		trace_cpufreq_interactive_notyet(
 			data, cpu_load, pcpu->target_freq,
 			pcpu->policy->cur, new_freq);
 		spin_unlock_irqrestore(&pcpu->target_freq_lock, flags);
 		goto rearm;
 	}
-
-	pcpu->hispeed_validate_time = now;
 
 	if (cpufreq_frequency_table_target(pcpu->policy, pcpu->freq_table,
 					   new_freq, CPUFREQ_RELATION_L,
@@ -1009,6 +1010,7 @@ static int cpufreq_interactive_speedchange_task(void *data)
 		for_each_cpu(cpu, &tmp_mask) {
 			unsigned int j;
 			unsigned int max_freq = 0;
+			struct cpufreq_interactive_cpuinfo *pjcpu;
 
 			pcpu = &per_cpu(cpuinfo, cpu);
 
@@ -1020,17 +1022,23 @@ static int cpufreq_interactive_speedchange_task(void *data)
 			}
 
 			for_each_cpu(j, pcpu->policy->cpus) {
-				struct cpufreq_interactive_cpuinfo *pjcpu =
-					&per_cpu(cpuinfo, j);
+				pjcpu = &per_cpu(cpuinfo, j);
 
 				if (pjcpu->target_freq > max_freq)
 					max_freq = pjcpu->target_freq;
 			}
 
-			if (max_freq != pcpu->policy->cur)
+			if (max_freq != pcpu->policy->cur) {
+				u64 now;
 				__cpufreq_driver_target(pcpu->policy,
 							max_freq,
 							CPUFREQ_RELATION_H);
+				now = ktime_to_us(ktime_get());
+				for_each_cpu(j, pcpu->policy->cpus) {
+					pjcpu = &per_cpu(cpuinfo, j);
+					pjcpu->hispeed_validate_time = now;
+				}
+			}
 
 #if defined(CONFIG_CPU_THERMAL_IPA)
 			ipa_cpufreq_requested(pcpu->policy, max_freq);
@@ -1101,7 +1109,7 @@ static int cpufreq_interactive_notifier(
 	int cpu;
 	unsigned long flags;
 
-	if (val == CPUFREQ_POSTCHANGE) {
+	if (val == CPUFREQ_PRECHANGE) {
 		pcpu = &per_cpu(cpuinfo, freq->cpu);
 		if (!down_read_trylock(&pcpu->enable_sem))
 			return 0;
@@ -1935,22 +1943,36 @@ show_gov_pol_sys(cpu_util);
 #ifdef CONFIG_PMU_COREMEM_RATIO
 show_gov_pol_sys(region_time_in_state);
 #endif
+
+#define gov_sys_attr_ro(_name)						\
+static struct global_attr _name##_gov_sys =				\
+__ATTR(_name, 0440, show_##_name##_gov_sys, store_##_name##_gov_sys)
+
+#define gov_pol_attr_ro(_name)						\
+static struct freq_attr _name##_gov_pol =				\
+__ATTR(_name, 0440, show_##_name##_gov_pol, store_##_name##_gov_pol)
+
+#define gov_sys_pol_attr_ro(_name)					\
+	gov_sys_attr_ro(_name);						\
+	gov_pol_attr_ro(_name)
+
+gov_sys_pol_attr_ro(target_loads);
+gov_sys_pol_attr_ro(above_hispeed_delay);
+gov_sys_pol_attr_ro(go_hispeed_load);
+
 #define gov_sys_attr_rw(_name)						\
 static struct global_attr _name##_gov_sys =				\
-__ATTR(_name, 0660, show_##_name##_gov_sys, store_##_name##_gov_sys)
+__ATTR(_name, 0664, show_##_name##_gov_sys, store_##_name##_gov_sys)
 
 #define gov_pol_attr_rw(_name)						\
 static struct freq_attr _name##_gov_pol =				\
-__ATTR(_name, 0660, show_##_name##_gov_pol, store_##_name##_gov_pol)
+__ATTR(_name, 0664, show_##_name##_gov_pol, store_##_name##_gov_pol)
 
 #define gov_sys_pol_attr_rw(_name)					\
 	gov_sys_attr_rw(_name);						\
 	gov_pol_attr_rw(_name)
 
-gov_sys_pol_attr_rw(target_loads);
-gov_sys_pol_attr_rw(above_hispeed_delay);
 gov_sys_pol_attr_rw(hispeed_freq);
-gov_sys_pol_attr_rw(go_hispeed_load);
 gov_sys_pol_attr_rw(min_sample_time);
 gov_sys_pol_attr_rw(timer_rate);
 gov_sys_pol_attr_rw(timer_slack);
